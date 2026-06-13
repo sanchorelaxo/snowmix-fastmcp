@@ -49,8 +49,48 @@ This skill governs the Python `fastmcp` server at `/home/rjodouin/Documents/git/
 | Tool Name | Description |
 |-----------|-------------|
 | `snowmix_get_system_geometry` | Get the current system geometry configuration (resolution, frame rate, etc.) |
-| `snowmix_add_video_feed` | Add a new video feed with a specific ID, file path, width, and height |
-| `snowmix_get_feed_info` | Get information about a specific video feed by its ID |
+| `snowmix_get_version` | Get the Snowmix version string from the connection banner. |
+| **Video Feeds** | |
+| `snowmix_add_video_feed` | Add a new video feed with ID, file path, width, and height. |
+| `snowmix_get_feed_info` | Get information about a specific video feed by its ID. |
+| `snowmix_list_feeds` | List all video feeds with their names and IDs. |
+| `snowmix_update_feed_name` | Rename an existing video feed. |
+| `snowmix_create_feed` | Create a video feed by name (0 = auto-assign ID). |
+| **Virtual Feeds** | |
+| `snowmix_create_vfeed` | Create a new virtual feed (ID range 0–31). |
+| `snowmix_list_vfeeds` | List all virtual feeds. |
+| `snowmix_vfeed_source` | Route a real video feed into a virtual feed. |
+| `snowmix_delete_vfeed` | Remove a virtual feed. |
+| **Audio Feeds** | |
+| `snowmix_create_audio_feed` | Create a new audio feed. |
+| `snowmix_list_audio_feeds` | List all audio feeds. |
+| `snowmix_get_audio_feed_info` | Get detailed info for an audio feed (rate, channels, format). |
+| `snowmix_delete_audio_feed` | Delete an audio feed. |
+| **Audio Mixers** | |
+| `snowmix_create_audio_mixer` | Create a new audio mixer. |
+| `snowmix_list_audio_mixers` | List all audio mixers. |
+| `snowmix_audio_mixer_add_feed` | Route an audio feed into a mixer (rates must match). |
+| `snowmix_get_audio_mixer_info` | Get detailed info for an audio mixer. |
+| `snowmix_delete_audio_mixer` | Delete an audio mixer. |
+| **Audio Sinks** | |
+| `snowmix_create_audio_sink` | Create a new audio sink. |
+| `snowmix_list_audio_sinks` | List all audio sinks. |
+| `snowmix_audio_sink_add_mixer` | Route an audio mixer into a sink (rates must match). |
+| `snowmix_get_audio_sink_info` | Get detailed info for an audio sink. |
+| `snowmix_delete_audio_sink` | Delete an audio sink. |
+| **Text Overlays** | |
+| `snowmix_create_text` | Create a new text overlay. |
+| `snowmix_text_show` | Make a text overlay visible. |
+| `snowmix_text_hide` | Hide a text overlay. |
+| `snowmix_list_texts` | List all text overlays. |
+| **Image Overlays** | |
+| `snowmix_image_load` | Load an image file into Snowmix. |
+| `snowmix_list_images` | List all loaded images. |
+| `snowmix_get_image_info` | Get info for a loaded image. |
+| `snowmix_delete_image` | Remove a loaded image. |
+| **Commands (Macros)** | |
+| `snowmix_command_list` | List all custom commands (macros). |
+| `snowmix_command_delete` | Delete a custom command by name. |
 
 ## Critical Snowmix Protocol Quirks
 
