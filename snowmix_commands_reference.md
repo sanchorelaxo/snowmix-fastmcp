@@ -1,6 +1,6 @@
 # Snowmix Reserved Commands Reference
 
-This document catalogs the 17 categories of reserved commands in Snowmix 0.5.2.2, along with critical implementation notes discovered during MCP development.
+This document catalogs the 18 categories of reserved commands in Snowmix 0.5.2.2, along with critical implementation notes discovered during MCP development.
 
 > **⚠️ Critical Implementation Notes (Learned Today)**
 > 1. **Silent Success**: Many Snowmix commands (e.g., `feed add`, `feed geometry`) return **nothing** on success. Clients must handle read timeouts gracefully (e.g., return `"OK"` if no `MSG:` or `STAT:` error is received within the timeout window).
@@ -35,7 +35,7 @@ Mix multiple audio feeds together.
 - `audio mixer channels <id> <channels>` - Set output channels.
 - `audio mixer format <id> <format>` - Set output format.
 - `audio mixer rate <id> <rate>` - Set output sample rate.
-- `audio mixer source feed <mixer_id> <feed_id> <channel_map>` - Route an audio feed to the mixer.
+- `audio mixer source feed <mixer_id> <feed_id>` - Route an audio feed to the mixer. **⚠️ Mixer and feed must have matching sample rates** — see note below.
 - `audio mixer source mixer <mixer_id> <source_mixer_id>` - Route a mixer into another mixer.
 - `audio mixer mute <id> <0|1>` - Mute the mixer output.
 - `audio mixer volume <id> <volume>` - Set mixer output volume.
@@ -45,7 +45,7 @@ Mix multiple audio feeds together.
 Output audio from Snowmix to external destinations.
 - `audio sink add <id>` - Create a new audio sink.
 - `audio sink drop <id>` - Remove an audio sink.
-- `audio sink source <id> <mixer_id>` - Set the mixer feeding this sink.
+- `audio sink source mixer <id> <mixer_id>` - Set the mixer feeding this sink. **⚠️ Sink and mixer must have matching sample rates** — see note below.
 - `audio sink start <id>` - Start the sink.
 - `audio sink stop <id>` - Stop the sink.
 - `audio sink info <id>` - Get sink information.
@@ -199,7 +199,8 @@ Render and animate text overlays.
 
 ## 17. Virtual Feed (vfeed) commands
 Create placeholder feeds for complex overlay routing and compositing.
-- `vfeed add <id>` - Create a new virtual feed.
+- `vfeed add <id> <name>` - Create a new virtual feed.
+- `vfeed add` - **List all virtual feeds** (no arguments = list mode). Outputs `STAT: vfeed <id> : <name>`. Bare `vfeed` is NOT a recognized command.
 - `vfeed drop <id>` - Remove a virtual feed.
 - `vfeed geometry <id> <width> <height>` - Set the virtual feed resolution.
 - `vfeed source <id> <feed_id>` - Route a real feed into this virtual feed.
@@ -208,6 +209,17 @@ Create placeholder feeds for complex overlay routing and compositing.
 - `vfeed switch <id>` - Switch the main output to this virtual feed.
 - `vfeed move coor <id> <x1> <y1> <x2> <y2> <duration>` - Animate the vfeed position.
 - `vfeed info <id>` - Get virtual feed information.
+
+---
+
+## 18. Custom Commands (Macros)
+Create and manage custom command macros. Commands can chain any reserved commands together for automation.
+- `command create <name>` - Enter command creation mode. Each subsequent line is a command line pushed onto the macro.
+- `command end` - Exit creation mode and finalize the command.
+- `command list` - List all commands. **Returns `MSG:` lines, not `STAT:` lines** — unlike most other list commands.
+- `command push <name> <line>` - Push a line onto a command (outside of creation mode).
+- `command delete <name>` - Delete a command.
+- `command restart <name>` - Restart a command from the beginning.
 
 ---
 

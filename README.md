@@ -94,7 +94,11 @@ pytest test_snowmix.py -v
 
 - **Silent Success**: Many Snowmix commands return nothing on success. The `SnowmixClient` handles this by returning `"OK"` if a 1.0s read timeout occurs with no `MSG:` or `STAT:` error lines.
 - **Connection Banner**: Snowmix sends `Snowmix version X.Y.Z.\n` immediately upon TCP connect. The client consumes this automatically.
-- **Multi-Step Feed Creation**: The legacy `feed file <id> "<path>"` command fails with `MSG: Invalid parameters` when paths contain spaces. This client uses the robust `feed add <id> "<name>"` followed by `feed geometry <id> <w> <h>` pattern.
+- **Multi-Step Feed Creation**: The legacy `feed file <id> "<path>"` command fails with `MSG: Invalid parameters` when paths contain spaces. This client uses the robust `feed add <id> <name>` followed by `feed geometry <id> <w> <h>` pattern.
+- **Audio Rate Matching**: When routing audio feeds to mixers or mixers to sinks, Snowmix enforces matching sample rates. If the rates don't match, Snowmix returns the deceptive error `MSG: Invalid number of parameters` instead of a rate mismatch message. Always set `audio mixer rate <id> <rate>` and `audio sink rate <id> <rate>` to match the source's rate before calling `audio mixer source feed` or `audio sink source mixer`.
+- **`vfeed add` Lists vfeeds**: `vfeed add` with no arguments lists all virtual feeds. Bare `vfeed` is not a recognized command.
+- **`feed name` for Renames**: Use `feed name <id> <newname>` to rename a feed. Re-issuing `feed add <id> <name>` on an existing feed fails with `MSG: Feed ID <id> already used`.
+- **`command list` Returns `MSG:` Lines**: Unlike most list commands (`STAT:`), `command list` returns `MSG:` lines. Parsers must handle both prefixes.
 
 ## References
 
