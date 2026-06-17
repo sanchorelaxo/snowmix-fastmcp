@@ -130,6 +130,30 @@ class SnowmixClient:
         "Return OK on success, or error message."
         return await self.send_command(f'feed name {feed_id} {name}')
 
+    async def feed_geometry(self, feed_id: int, width: int, height: int) -> str:
+        return await self.send_command(f'feed geometry {feed_id} {width} {height}')
+
+    async def feed_socket(self, feed_id: int, socket_path: str) -> str:
+        """Set the shared-memory socket path for a feed.
+
+        GStreamer's shmsink connects to this path to deliver video frames.
+        """
+        return await self.send_command(f'feed socket {feed_id} {socket_path}')
+
+    async def feed_live(self, feed_id: int) -> str:
+        """Mark a feed as live."""
+        return await self.send_command(f'feed live {feed_id}')
+
+    async def stack(self, layer: int, feed_id: int | None = None) -> str:
+        """Stack a feed onto the mixer output.
+
+        With one arg: stack 0  (background only)
+        With two args: stack 0 1  (feed 1 at layer 0)
+        """
+        if feed_id is None:
+            return await self.send_command(f'stack {layer}')
+        return await self.send_command(f'stack {layer} {feed_id}')
+
     async def add_video_feed(self, feed_id: int, file_path: str,
                              width: int = 1024, height: int = 576) -> str:
         feed_name = file_path.split('/')[-1] or f'Feed_{feed_id}'
@@ -290,6 +314,55 @@ class SnowmixClient:
         results = [await self.send_command(c) for c in cmds]
         return '\n'.join(results)
 
+    async def text_font(self, text_id: int, fontspec: str) -> str:
+        """Set font for a text overlay.
+
+        Syntax: text font <text_id> <font_name> <size>
+        """
+        return await self.send_command(f'text font {text_id} {fontspec}')
+
+    async def text_place_align(self, place_id: int, horiz: str, vert: str) -> str:
+        """Set text alignment.
+
+        Syntax: text align <place_id> <horiz> <vert>
+        (text place align is obsolete in 0.5.0+)
+        """
+        return await self.send_command(f'text align {place_id} {horiz} {vert}')
+
+    async def text_place_background(
+        self, place_id: int, r1: int, r2: int, r3: int, r4: int,
+        r: float, g: float, b: float, a: float,
+    ) -> str:
+        """Set text background rectangle.
+
+        Syntax: text backgr <id> <x> <y> <w> <h> <r> <g> <b> <a>
+        (text place backgr is obsolete in 0.5.0+)
+        """
+        return await self.send_command(
+            f'text backgr {place_id} {r1} {r2} {r3} {r4} {r} {g} {b} {a}',
+        )
+
+    async def text_place_clip(self, place_id: int, x: int, y: int, w: int, h: int) -> str:
+        """Set text clip rectangle.
+
+        Syntax: text clipabs <id> <x> <y> <w> <h>
+        (text place clipabs is obsolete in 0.5.0+)
+        """
+        return await self.send_command(f'text clipabs {place_id} {x} {y} {w} {h}')
+
+    async def text_place_repeat(
+        self, place_id: int, mode: str,
+        a: int, b: int, c: int, d: int,
+    ) -> str:
+        """Set text repeat move (for marquee).
+
+        Syntax: text repeat move <id> <dx> <dy> <end_x> <end_y>
+        (text place repeat move is obsolete in 0.5.0+)
+        """
+        return await self.send_command(
+            f'text repeat {mode} {place_id} {a} {b} {c} {d}',
+        )
+
     async def text_place(self, place_id: int, text_id: int, font_id: int,
                          x: int, y: int, r: float = 1.0, g: float = 1.0,
                          b: float = 1.0, a: float = 1.0, anchor: str = 'nw') -> str:
@@ -304,43 +377,76 @@ class SnowmixClient:
         return await self.send_command(f'text hide {text_id}')
 
     async def list_texts(self) -> list[dict[str, Any]]:
-        raw = await self.send_command('text list')
-        # TODO: parse actual format once verified against running Snowmix
-        return [{'id': int(m.group(1))}
-                for line in raw.splitlines()
-                if (m := re.search(r'text\s+(\d+)', line))]
+        """List placed text items.
+
+        Uses 'text place' (bare, no args) which returns placed text info.
+        """
+        raw = await self.send_command('text place')
+        texts: list[dict[str, Any]] = []
+        for line in raw.splitlines():
+            m = re.search(r'Text place id\s+(\d+)\s+text id\s+(\d+)\s+font\s+(\d+)', line)
+            if m:
+                texts.append({
+                    'place_id': int(m.group(1)),
+                    'text_id': int(m.group(2)),
+                    'font_id': int(m.group(3)),
+                })
+        return texts
 
     # ------------------------------------------------------------------ #
     #  Images & Image Places
     # ------------------------------------------------------------------ #
 
     async def image_load(self, image_id: int, file_path: str) -> str:
+        """Load a PNG image into Snowmix.
+
+        Snowmix's C parser uses sscanf("%u %[^\\n]") — no quote stripping.
+        Send the bare path without quotes.
+        """
         return await self.send_command(f'image load {image_id} {file_path}')
+
+    async def image_name(self, image_id: int, name: str) -> str:
+        """Assign a human-readable name to a loaded image.
+
+        Syntax: image name <id> <name>
+        """
+        return await self.send_command(f'image name {image_id} {name}')
 
     async def image_place(self, place_id: int, image_id: int,
                           x: int = 0, y: int = 0) -> str:
         return await self.send_command(f'image place {place_id} {image_id} {x} {y}')
 
     async def image_overlay(self, place_ids: list[int]) -> str:
+        """Overlay images. Requires a running video pipeline (m_overlay != NULL).
+
+        Without a pipeline, Snowmix returns 'Invalid parameters'.
+        """
         return await self.send_command('image overlay ' + ' '.join(str(p) for p in place_ids))
 
     async def image_hide(self, image_id: int) -> str:
         return await self.send_command(f'image hide {image_id}')
 
-    async def list_images(self) -> list[dict[str, Any]]:
-        raw = await self.send_command('image list')
-        images: list[dict[str, Any]] = []
-        for line in raw.splitlines():
-            m = re.search(r'image\s+(\d+)\s*=\s*"(.+)"', line)
-            if m:
-                images.append({'id': int(m.group(1)), 'filename': m.group(2)})
-        return images
+    async def list_images(self) -> dict[str, int]:
+        """Query image load/place counts.
+
+        Snowmix 0.5.2.2 has no 'image list' command.
+        Uses 'image maxplaces load' and 'image maxplaces place'.
+        """
+        raw_load = await self.send_command('image maxplaces load')
+        raw_place = await self.send_command('image maxplaces place')
+        result: dict[str, int] = {}
+        m = re.search(r'load\s+(\d+)\s+used\s+(\d+)', raw_load)
+        if m:
+            result['max_load'] = int(m.group(1))
+            result['used_load'] = int(m.group(2))
+        m = re.search(r'place\s+(\d+)\s+used\s+(\d+)', raw_place)
+        if m:
+            result['max_place'] = int(m.group(1))
+            result['used_place'] = int(m.group(2))
+        return result
 
     async def get_image_info(self, image_id: int) -> str:
-        return await self.send_command(f'image info {image_id}')
-
-    async def delete_image(self, image_id: int) -> str:
-        return await self.send_command(f'image delete {image_id}')
+        return await self.send_command(f'image name {image_id}')
 
     # ------------------------------------------------------------------ #
     #  Custom Commands (scripts)
