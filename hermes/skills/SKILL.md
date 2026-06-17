@@ -1,7 +1,7 @@
 ---
 name: snowmix-mcp
 description: Control Snowmix video mixer via FastMCP (Python). Use for video mixing, feed switching, text/image overlays, and audio routing.
-version: 2.1.0
+version: 2.2.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -32,6 +32,9 @@ This skill governs the Python `fastmcp` server at `/home/rjodouin/Documents/git/
 - `test_snowmix.py` — pytest + pytest-asyncio suite (25 tests, all green); owns the module-scoped Snowmix subprocess fixture.
 - `snowmix_commands_reference.md` — local command cheat sheet (18 categories with verified syntax).
 - `ini/test.ini` — test ini with full subsystem allocations (audio maxplaces, image maxplaces, etc.).
+- `ini/advancedTest.ini` — advanced test ini with correct maxplaces ordering (before `system geometry`), `stack 0`, overlay pre/finish commands, 1280x720 BGRA.
+- `test_advanced.py` — advanced pytest suite (14 tests, all green) for image load/name, text place/align/clipabs/repeat, feed creation.
+- `test_e2e.py` — end-to-end test with GStreamer video input/output pipelines (in progress).
 - `pyproject.toml` — pytest asyncio config + ruff settings.
 - `conftest.py` — pytest-asyncio auto mode.
 
@@ -105,7 +108,40 @@ These discoveries came from C++ source analysis (Snowmix 0.5.2.2) and are NOT in
 - **Multi-step feed creation**: `feed file <id> "<path>"` fails with spaces in the path. Use:
   1. `feed add <id> <name>`
   2. `feed geometry <id> <width> <height>`
-- **Quoting**: Quote any name/path containing spaces. Never batch multiple commands into one TCP frame.
+- **Quoting**: Quote names containing spaces in `feed add`/`feed name`. BUT **do NOT quote file paths in `image load`** — the C parser uses `sscanf("%u %[^\n]")` which does not strip quotes; quoting the path causes it to be read as `"/path/to/file.png"` (with literal quotes) and the file won't be found. Send the bare path: `image load 1 /path/to/file.png`. Never batch multiple commands into one TCP frame.
+
+### Image/Text/Feed maxplaces pitfall (Critical)
+
+Snowmix 0.5.2.2 initializes image, text, and feed subsystems with small default slot counts (commonly 16). If a test or tool issues `image load 1001 <path>` and the current `image maxplaces load` value is ≤ 1001, `LoadImage` returns -1. The `CController` dispatcher maps `-1` to:
+
+```
+MSG: Invalid number of parameters: "image load 1001 <path> "
+```
+
+This message is misleading: the syntax is correct; the id simply exceeds the allocated table size.
+
+**CRITICAL: maxplaces must come BEFORE `system geometry` in the INI file.** `system geometry` triggers CVideoFeeds creation which locks in the max. If maxplaces comes after geometry, the defaults (16) are already baked in and your maxplaces directives silently fail to take effect for existing subsystems.
+
+**Correct INI ordering:**
+```ini
+system control port 9999
+
+# maxplaces FIRST — before any geometry/feed/text/image commands
+maxplaces strings 5000
+maxplaces fonts 5000
+maxplaces texts 5000
+maxplaces images 5000
+maxplaces imageplaces 5000
+maxplaces video feeds 5000
+maxplaces virtual feeds 5000
+
+# NOW safe to set geometry (creates CVideoFeeds with maxplaces=5000)
+system geometry 1280 720 BGRA
+system frame rate 24
+system socket /tmp/mixer1
+```
+
+**How to diagnose:** Run `image maxplaces load` (no args) and check the reported limit. If it is less than or equal to the id you are trying to use, that is the cause. Also verify `system info` reports `Video image: loaded`; if it says `no`, the subsystem was never activated.
 
 ### Audio Rate Matching (Critical)
 
@@ -125,6 +161,62 @@ await client.audio_sink_add_mixer(1, 1)
 ```
 
 **How to diagnose:** If `audio mixer source feed X Y` returns "Invalid number of parameters" but you've confirmed the syntax is correct and both entities exist, check their rates with `audio feed info Y` and `audio mixer info X`. A mismatch in the `rate` or `channels` fields is the root cause.
+
+### Obsolete Text Commands (0.5.0+ — Critical)
+
+In Snowmix 0.5.0+, `text place <subcommand>` is **OBSOLETE**. The `text place` prefix has been removed — use `text <subcommand>` directly:
+
+| OBSOLETE (pre-0.5.0) | CORRECT (0.5.0+) |
+|----------------------|-------------------|
+| `text place align <id> ...` | `text align <id> ...` |
+| `text place backgr <id> ...` | `text backgr <id> ...` |
+| `text place clipabs <id> ...` | `text clipabs <id> ...` |
+| `text place repeat move <id> ...` | `text repeat move <id> ...` |
+
+**Note:** `text place <place_id> <text_id> <font_id> <x> <y> <r> <g> <b> <a> <anchor>` (the placement command itself) is NOT obsolete — only the `text place <subcommand>` form is. The bare `text place` with numeric args still works for placing text.
+
+Found in `video_text.cpp` lines 276-278: the parser explicitly checks for and rejects `text place <word>` where `<word>` is not a number.
+
+### Image Overlay Requires Running Pipeline (Critical)
+
+`image overlay <place_ids>` requires a running video pipeline — `m_overlay` is NULL until frame processing starts. Without a pipeline, Snowmix returns `MSG: Invalid parameters`.
+
+To make `image overlay` work:
+1. Start GStreamer input pipeline feeding video into a Snowmix feed via shmsink
+2. Start GStreamer output pipeline reading from Snowmix's mixer socket via shmsrc
+3. The mixing loop activates when output starts reading frames
+4. NOW `image overlay` will succeed
+
+### No `image list` or `image info` Command
+
+Snowmix 0.5.2.2's C++ parser has NO `image list` or `image info` command. The only image query commands are:
+- `image name <id>` — get the name of a loaded image (returns `MSG:` line)
+- `image name <id> <name>` — set the name of a loaded image
+- `image maxplaces load` — returns max/used counts (e.g., `5000 used 1`)
+- `image maxplaces place` — returns max/used counts for placed images
+
+The client's `list_images()` method uses `image maxplaces load/place` to get counts.
+
+### Stack and Feed Socket for GStreamer Integration
+
+To use GStreamer pipelines with Snowmix feeds:
+1. `feed add <id> <name>` — create the feed
+2. `feed geometry <id> <width> <height>` — set resolution (must match system geometry or smaller)
+3. `feed socket <id> /tmp/feedN-control-pipe` — set the shared-memory socket path for GStreamer's shmsink
+4. `feed live <id>` — mark as live
+5. `stack 0 <feed_id>` — stack the feed onto the mixer output
+
+**Pitfall:** `stack 0 <feed_id>` can crash Snowmix if the feed has no data source connected yet (no GStreamer shmsink writing to the feed socket). Either:
+- Stack only feed 0 (`stack 0`) before the pipeline starts, then `stack 0 <feed_id>` after data flows
+- Or start the GStreamer input pipeline first, then stack
+
+### Snowmix Process Management for Tests
+
+When spawning Snowmix as a subprocess in tests:
+- **Use `stdout=DEVNULL`**, NOT `tee` or pipe redirection. Snowmix checks if stdout (fd 1) is closed and bails out with: `WARNING. Creating a socket returned fd 1. This means that stdout was closed upon startup. Bailing out.`
+- Always `pkill -9 snowmix` and clean up socket files (`/tmp/mixer1`, feed sockets) before starting
+- Wait 2 seconds after spawn for port 9999 to bind
+- The `SNOWMIX` env var must point to the installation root (e.g., `/home/rjodouin/Snowmix-0.5.2.2`), NOT the `src/` subdirectory
 
 ## Common Snowmix Reserved Commands
 
@@ -174,6 +266,26 @@ await client.audio_sink_add_mixer(1, 1)
 ### Verify Feed Creation
 **User:** "Check if feed 100 was created successfully."
 **Action:** Call `snowmix_get_feed_info` with `feed_id=100`.
+
+### List All Feeds
+**User:** "List all video feeds."
+**Action:** Call `snowmix_list_feeds`.
+
+### Rename a Feed
+**User:** "Rename feed 100 to 'New Name'."
+**Action:** Call `snowmix_update_feed_name` with `feed_id=100`, `name="New Name"`.
+
+### Route Audio to Mixer
+**User:** "Route audio feed 2 into mixer 1."
+**Action:** Call `snowmix_audio_mixer_add_feed` with `mixer_id=1`, `feed_id=2`.
+
+### Create Text Overlay
+**User:** "Show 'Hello World' on the screen."
+**Action:** Call `snowmix_create_text` with `text_id=1`, `string="Hello World"`, then `snowmix_text_show` with `text_id=1`.
+
+### Load an Image
+**User:** "Load /path/to/logo.png as image 5."
+**Action:** Call `snowmix_image_load` with `image_id=5`, `file_path="/path/to/logo.png"`.
 
 ## Test Fixture Pattern
 
@@ -231,7 +343,7 @@ pytest test_snowmix.py -v
 ## Porting node-snowmix Tests
 
 Map node-snowmix suites to Python equivalents:
-- `feeds.js` → create/rename/delete feeds, check `all()`, `byId()`, `allIds()` — **ported (5 tests pass)**
+- `feeds.js` → create/rename/delete feeds, check `all()`, `byId()`, `allIds()` — **ported (6 tests pass)**
 - `vfeeds.js` → add/rename/delete vfeeds, source mapping — **ported (4 tests pass)**
 - `system-geometry.js` → assert `system geometry` response — **ported (1 test passes)**
 - `commands.js` → create/list/delete custom commands — **ported (1 test passes)**
@@ -244,7 +356,7 @@ See `references/node-snowmix-tests.md` for detailed port status.
 
 ## Troubleshooting
 
-- **Connection Refused**: Snowmix is not running. Start it with `export SNOWMIX=/home/rjodouin/Snowmix-0.5.2.2/src && /usr/local/bin/snowmix /home/rjodouin/Documents/git/snowmix-fastmcp/ini/test.ini`.
+- **Connection Refused**: Snowmix is not running. Start it with `export SNOWMIX=/home/rjodouin/Snowmix-0.5.2.2 && /usr/local/bin/snowmix /home/rjodouin/Documents/git/snowmix-fastmcp/ini/test.ini`. The `SNOWMIX` env var must point to the installation root (NOT the `src/` subdirectory).
 - **All Tests Error**: Likely Snowmix not running. Run `pgrep snowmix` — if nothing, start it. The test fixture spawns its own process; check `test.ini` exists.
 - **Command Silent/Timeout**: Snowmix commands are silent on success. The Python client handles this by returning "OK" on timeout.
 - **MCP Tool Not Found**: Ensure the MCP server is registered in Hermes config and the virtual environment is activated.
@@ -257,9 +369,43 @@ See `references/node-snowmix-tests.md` for detailed port status.
 4. **pytest-asyncio Config**: The project requires `asyncio_mode = "auto"` set via `pyproject.toml` (`[tool.pytest.ini_options]`). A `conftest.py` also sets this.
 5. **Rate Matching Required**: Adding an audio feed to a mixer, or a mixer to a sink, requires matching sample rates. See Audio Rate Matching section above.
 6. **Feed Switching Uses `stack`**: The `feed switch <id>` reserved command may not work. Use `stack 0 <feed_id>` instead (from video-switcher.ini examples).
+7. **Always Test via MCP Tools, Never Raw Commands**: When writing tests that exercise ops from expanded ini files, use `SnowmixClient` structured methods (the same calls the MCP tools make). Never call `client.send_command("raw snowmix command")` in tests — defeats the purpose of testing MCP-equivalent behavior. The `snowmix_client.py` methods ARE the MCP tool implementations; test those.
+8. **Image/Text Subsystems May Need Explicit Loading**: Setting `maxplaces images 16` in an ini allocates slots but does NOT necessarily activate the image subsystem. Some Snowmix builds require a slib include (`slib images.slib`) or a `load images` directive. If `image load <id> <path>` returns "Invalid number of parameters" despite correct syntax, the images subsystem isn't active. Check `system info` for `Video image: loaded`. If it says `no`, the ini needs `load images` or the corresponding slib include.
+9. **maxplaces BEFORE system geometry**: The maxplaces directives in the INI file must appear BEFORE `system geometry`. Geometry triggers CVideoFeeds creation which locks in the max. If maxplaces comes after, defaults (16) are baked in and your directives silently fail. This is the #1 cause of "Invalid number of parameters" on image/text commands with IDs > 16.
+10. **image load — NO quotes on file path**: The C parser uses `sscanf("%u %[^\n]")` which does not strip quotes. `image load 1 "/path/to/file.png"` will fail. Send the bare path: `image load 1 /path/to/file.png`.
+11. **text place <subcommand> is OBSOLETE in 0.5.0+**: Use `text align`, `text backgr`, `text clipabs`, `text repeat move` directly. The `text place` prefix is only valid for the numeric placement command: `text place <place_id> <text_id> <font_id> <x> <y> ...`.
+12. **image overlay requires running pipeline**: `image overlay` returns "Invalid parameters" unless GStreamer input+output pipelines are active (m_overlay is NULL until frame processing starts).
+13. **Snowmix stdout must be DEVNULL**: When spawning Snowmix as a subprocess, use `stdout=DEVNULL`. Using `tee` or pipe redirection closes fd 1, causing Snowmix to bail with "Creating a socket returned fd 1. This means that stdout was closed upon startup."
+14. **stack can crash Snowmix**: `stack 0 <feed_id>` can crash Snowmix if the feed has no data source connected. Start the GStreamer input pipeline first, then stack.
+
+## Maxplaces Keyword Reference
+
+The correct maxplaces keywords (verified from `controller.cpp:set_maxplaces()` at line ~2239 in Snowmix 0.5.2.2) are **space-separated** strings. Using underscored forms like `placed_images` or `loaded_images` does NOT work — the parser looks for exact string matches:
+
+| Keyword (as parsed) | What it controls |
+|---------------------|-----------------|
+| `strings` | Text strings |
+| `fonts` | Font slots |
+| `texts` | Placed text items |
+| `images` | Loaded images |
+| `imageplaces` | Placed images |
+| `video feeds` | Video feeds |
+| `virtual feeds` | Virtual feeds |
+| `audio feeds` | Audio feeds |
+| `audio mixers` | Audio mixers |
+| `audio sinks` | Audio sinks |
+| `shapes` | Shapes |
+| `shapeplaces` | Placed shapes |
+
+Usage in INI: `maxplaces images 5000` or `maxplaces video feeds 5000`.
+
+**CRITICAL:** These must appear BEFORE `system geometry` in the INI file. See the Image/Text/Feed maxplaces pitfall section above.
 
 ## References
 
 - `references/node-snowmix-tests.md` — Extracted test specs and mapping notes from the node-snowmix test suite.
+- `references/image-subsystem-diagnostics.md` — C++ source analysis of image load/name/overlay commands, maxplaces keywords, and subsystem activation quirks.
+- `references/advanced-tests-roadmap.md` — State of `test_advanced.py`, why `test_image_load_basic` fails, and how to complete the fix.
+- `references/gstreamer-e2e-pipelines.md` — GStreamer pipeline patterns for feeding video into Snowmix (shmsink) and reading mixed output (shmsrc), plus e2e test architecture.
 - `/home/rjodouin/Documents/git/snowmix-fastmcp/snowmix_commands_reference.md` — Local command reference covering all 18 Snowmix command categories with verified syntax.
 - [Snowmix Reserved Commands](https://snowmix.sourceforge.io/Documentation/reserved.html) — Official documentation (note: syntax for some commands differs from source-code reality).
