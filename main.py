@@ -584,58 +584,91 @@ _active_bridge: "SnowmixBridge | None" = None
 
 @mcp.tool()
 async def snowmix_bridge_start(
-    video_file: str = "",
+    video_files: str = "",
     image_file: str = "",
-    text_string: str = "Snowmix",
+    text_string: str = "",
+    text_font: str = "FreeSans Bold 64",
+    text_color: str = "1.0,1.0,1.0,1.0",
+    text_shadow: bool = False,
+    text_anchor: str = "s",
     width: int = 1280,
     height: int = 720,
     tcp_port: int = 5000,
+    layout: str = "side_by_side",
 ) -> str:
     """
-    Start the OBS TCP bridge: Snowmix + video input + TCP server.
+    Start the OBS TCP bridge: Snowmix + video inputs + TCP server.
 
-    This bypasses the Flatpak /dev/shm sandbox that prevents OBS Studio's
-    GStreamer shmsrc from mmap-ing Snowmix's shared-memory segments.
-    The bridge reads Snowmix output via shmsrc on the host and re-serves
-    it over TCP localhost (port 5000 by default).
+    Supports multiple video sources with automatic layout.  This bypasses
+    the Flatpak /dev/shm sandbox that prevents OBS Studio's GStreamer
+    shmsrc from mmap-ing Snowmix's shared-memory segments.  The bridge
+    reads Snowmix output via shmsrc on the host and re-serves it over
+    TCP localhost (port 5000 by default).
 
     In OBS, add an obs-gstreamer source with pipeline:
         tcpclientsrc host=127.0.0.1 port=5000 ! tsdemux ! decodebin ! videoconvert ! video.
 
     Args:
-        video_file: Path to video file for feed input (empty = no video input).
+        video_files: Comma-separated video file paths (e.g. "/a.mp4,/b.mp4").
         image_file: Path to PNG image overlay (empty = no image).
         text_string: Text overlay string (empty = no text).
-        width: Video width (must match ini, default 1280).
-        height: Video height (must match ini, default 720).
+        text_font: Font specification (e.g. "FreeSans Bold 64").
+        text_color: Text color R,G,B,A (e.g. "0.3,0.0,0.5,1.0").
+        text_shadow: Enable white shadow with +2px offset.
+        text_anchor: Anchor position (nw,n,ne,w,c,e,sw,s,se).
+        width: Canvas width (default 1280).
+        height: Canvas height (default 720).
         tcp_port: TCP port for OBS to connect to (default 5000).
+        layout: Layout mode: side_by_side, grid, or manual.
     """
     global _active_bridge
-    from obs_bridge import BridgeConfig, SnowmixBridge
+    from obs_bridge import BridgeConfig, SnowmixBridge, VideoSource, TextOverlay
 
     if _active_bridge and _active_bridge.status.running:
         await _active_bridge.stop()
 
+    # Parse video files
+    paths = [v.strip() for v in video_files.split(",") if v.strip()]
+    sources = [VideoSource(path=p) for p in paths]
+
+    # Parse text overlay
+    text = None
+    if text_string:
+        tc = [float(x) for x in text_color.split(",")]
+        if len(tc) == 3:
+            tc.append(1.0)
+        text = TextOverlay(
+            string=text_string,
+            font=text_font,
+            r=tc[0], g=tc[1], b=tc[2], a=tc[3],
+            shadow=text_shadow,
+            anchor=text_anchor,
+        )
+
     config = BridgeConfig(
-        video_file=video_file,
+        sources=sources,
+        text=text,
         image_file=image_file,
-        text_string=text_string,
         width=width,
         height=height,
         tcp_port=tcp_port,
+        layout=layout,
     )
     _active_bridge = SnowmixBridge(config)
     status = await _active_bridge.start()
     if status.errors:
         return f"Bridge failed: {'; '.join(status.errors)}"
-    return (
-        f"OBS TCP bridge started.\n"
-        f"  Snowmix PID: {status.snowmix_pid}\n"
-        f"  Input PID:   {status.input_pid}\n"
-        f"  Bridge PID:  {status.bridge_pid}\n"
-        f"  TCP port:    {status.tcp_port}\n"
-        f"  OBS pipeline:\n    {status.obs_pipeline}"
-    )
+    lines = [
+        f"OBS TCP bridge started.",
+        f"  Snowmix PID:  {status.snowmix_pid}",
+        f"  Bridge PID:   {status.bridge_pid}",
+        f"  TCP port:     {status.tcp_port}",
+        f"  Sources:      {status.num_sources} ({layout})",
+    ]
+    for i, src in enumerate(config.sources):
+        lines.append(f"    [{i+1}] {src.width}x{src.height} @ ({src.shift_x},{src.shift_y})")
+    lines.append(f"  OBS pipeline:\n    {status.obs_pipeline}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -656,15 +689,21 @@ async def snowmix_bridge_status() -> str:
     if not _active_bridge:
         return "No active bridge."
     s = _active_bridge.status
-    return (
-        f"Running: {s.running}\n"
-        f"  Snowmix PID: {s.snowmix_pid}\n"
-        f"  Input PID:   {s.input_pid}\n"
-        f"  Bridge PID:  {s.bridge_pid}\n"
-        f"  TCP port:    {s.tcp_port}\n"
-        f"  Mixer socket: {s.mixer_socket}\n"
-        f"  OBS pipeline:\n    {s.obs_pipeline}"
-    )
+    lines = [
+        f"Running: {s.running}",
+        f"  Snowmix PID:  {s.snowmix_pid}",
+        f"  Bridge PID:   {s.bridge_pid}",
+        f"  Input PIDs:   {s.input_pids}",
+        f"  Sources:      {s.num_sources}",
+        f"  TCP port:     {s.tcp_port}",
+        f"  Mixer socket: {s.mixer_socket}",
+        f"  OBS pipeline:\n    {s.obs_pipeline}",
+    ]
+    if s.errors:
+        lines.append("  Errors:")
+        for e in s.errors:
+            lines.append(f"    {e}")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
