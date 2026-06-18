@@ -19,6 +19,8 @@ Flow:
 
 import asyncio
 import os
+import shlex
+import signal
 import shutil
 from pathlib import Path
 
@@ -83,9 +85,16 @@ async def snowmix_process():
             os.remove(sock)
 
     env = {**os.environ, "SNOWMIX": SNOWMIX_HOME}
+    # CRITICAL: keep stdin open via a pipe. Snowmix wires a default controller
+    # to stdin(fd 0)/stdout(fd 1). If stdin EOFs (e.g. inherited /dev/null),
+    # that controller closes, taking fd 1 with it. Later, when `feed socket`
+    # creates an AF_UNIX socket, the OS reuses fd 1 and Snowmix bails out with
+    # "Creating a socket returned fd 1 ... stdout was closed upon startup."
+    # Holding proc.stdin open prevents the EOF, so fd 0/1 stay alive.
     proc = await asyncio.create_subprocess_exec(
         SNOWMIX_BIN,
         str(INI_PATH),
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
         env=env,
@@ -93,6 +102,9 @@ async def snowmix_process():
     await asyncio.sleep(2)
     yield proc
     if proc.returncode is None:
+        # Close stdin first to let the default controller drain, then terminate.
+        if proc.stdin:
+            proc.stdin.close()
         proc.terminate()
         try:
             await asyncio.wait_for(proc.wait(), timeout=5)
@@ -131,7 +143,7 @@ async def start_gstreamer_input(video_path: str, feed_socket: str,
         f"shm-size={shm_size} wait-for-connection=0 sync=true"
     )
     proc = await asyncio.create_subprocess_exec(
-        GST_LAUNCH, "-q", pipeline,
+        GST_LAUNCH, "-q", *shlex.split(pipeline),
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -156,7 +168,7 @@ async def start_gstreamer_output(output_path: str, mixer_socket: str,
         f"! filesink location={output_path}"
     )
     proc = await asyncio.create_subprocess_exec(
-        GST_LAUNCH, "-e", "-v", pipeline,
+        GST_LAUNCH, "-e", "-v", *shlex.split(pipeline),
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -205,18 +217,43 @@ class TestEndToEnd:
     async def test_image_overlay_during_pipeline(self, client: SnowmixClient):
         """Load image, place it, and overlay while GStreamer pipeline runs.
 
-        This is the core e2e test: video flows in, image is overlaid,
-        mixed frames flow out to a file.
+        This is the core e2e test: video flows in, image+text are overlaid
+        every frame via the Show macro, mixed frames flow out to a file.
+
+        Note: ``image overlay`` / ``text overlay`` only work *during* the
+        per-frame mixing loop (``m_overlay`` is NULL between frames). So the
+        correct pattern is to embed them in the ``overlay finish`` macro
+        (``Show``), which Snowmix executes once per output frame.
         """
         # Ensure feed 1 is set up
         await setup_feed(client, 1)
 
-        # Load and place image
+        # Load and place image (place 1 <- image 1)
         resp = await client.image_load(1, IMAGE_FILE)
         assert resp == "OK", f"image load failed: {resp}"
 
         resp = await client.image_place(1, 1, 100, 50)
         assert resp == "OK", f"image place failed: {resp}"
+
+        # Set up text (string 1, font 1, place 1) before building the macro
+        await client.send_command("text string 1 Snowmix_E2E_Test")
+        await client.send_command("text font 1 FreeSans 24")
+        await client.text_place(1, 1, 1, 50, 50)
+
+        # Rebuild the Show macro to overlay image 1 + text 1 every frame.
+        # The INI created Show with just ``loop``; we replace it so the
+        # overlays run inside the mixing loop where m_overlay is valid.
+        await client.command_delete("Show")
+        await client.command_create("Show")
+        await client.send_command("image overlay 1")   # recorded into Show
+        await client.send_command("text overlay 1")     # recorded into Show
+        await client.send_command("loop")               # recorded into Show
+        await client.command_end()
+        await client.send_command("overlay finish Show")
+
+        # Sanity: Show is registered and bound
+        macros = await client.command_list_all()
+        assert "Show" in macros, f"Show macro missing from: {macros}"
 
         # Start GStreamer input (video -> Snowmix feed)
         input_proc = await start_gstreamer_input(
@@ -225,8 +262,9 @@ class TestEndToEnd:
         # Give input pipeline time to connect
         await asyncio.sleep(3)
 
-        # Start GStreamer output (Snowmix -> file)
-        # Clean up old output
+        # Start GStreamer output (Snowmix -> file). The shmsrc connecting to
+        # the mixer socket activates the mixing loop, which runs Show every
+        # frame, applying the image+text overlays automatically.
         if os.path.exists(OUTPUT_FILE):
             os.remove(OUTPUT_FILE)
 
@@ -234,33 +272,24 @@ class TestEndToEnd:
             OUTPUT_FILE, MIXER_SOCKET, WIDTH, HEIGHT
         )
 
-        # Give output pipeline time to start reading frames
-        await asyncio.sleep(2)
+        # Let it mix for several seconds
+        await asyncio.sleep(6)
 
-        # Now overlay the image (mixing loop is active because output is reading)
-        resp = await client.image_overlay([1])
-        # With pipeline running, overlay should succeed
-        assert resp == "OK" or "Invalid" not in resp, (
-            f"image overlay failed: {resp}"
-        )
-
-        # Add text overlay too
-        await client.send_command("text string 1 Snowmix_E2E_Test")
-        await client.send_command("text font 1 FreeSans 24")
-        await client.text_place(1, 1, 1, 50, 50)
-        await client.send_command("text overlay 1")
-
-        # Let it mix for a few seconds
-        await asyncio.sleep(5)
-
-        # Stop output first (sends EOS for proper mp4 finalization)
-        await stop_proc(output_proc)
+        # Stop output first with SIGINT so gst-launch (-e) sends EOS and
+        # mp4mux finalises a valid, playable mp4.
+        if output_proc.returncode is None:
+            output_proc.send_signal(signal.SIGINT)
+            try:
+                await asyncio.wait_for(output_proc.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                output_proc.kill()
+                await output_proc.wait()
         await stop_proc(input_proc)
 
-        # Verify output file exists and has content
+        # Verify output file exists and has real content
         assert os.path.exists(OUTPUT_FILE), "Output file was not created"
         size = os.path.getsize(OUTPUT_FILE)
-        assert size > 1000, f"Output file too small ({size} bytes)"
+        assert size > 10000, f"Output file too small ({size} bytes)"
         print(f"\nE2E output: {OUTPUT_FILE} ({size} bytes)")
 
     async def test_feed_status_after_streaming(self, client: SnowmixClient):

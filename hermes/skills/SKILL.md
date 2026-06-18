@@ -1,7 +1,7 @@
 ---
 name: snowmix-mcp
 description: Control Snowmix video mixer via FastMCP (Python). Use for video mixing, feed switching, text/image overlays, and audio routing.
-version: 2.2.0
+version: 2.6.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -34,7 +34,9 @@ This skill governs the Python `fastmcp` server at `/home/rjodouin/Documents/git/
 - `ini/test.ini` — test ini with full subsystem allocations (audio maxplaces, image maxplaces, etc.).
 - `ini/advancedTest.ini` — advanced test ini with correct maxplaces ordering (before `system geometry`), `stack 0`, overlay pre/finish commands, 1280x720 BGRA.
 - `test_advanced.py` — advanced pytest suite (14 tests, all green) for image load/name, text place/align/clipabs/repeat, feed creation.
-- `test_e2e.py` — end-to-end test with GStreamer video input/output pipelines (in progress).
+- `test_e2e.py` — end-to-end test (3 tests, all green): GStreamer video in → image+text overlay via Show macro → mixed h264 mp4 out. Uses `stdin=PIPE` to prevent the fd-1 bail-out and `shlex.split` for gst-launch pipelines.
+- `obs_bridge.py` — OBS TCP bridge module: `SnowmixBridge` class that manages Snowmix + video input + TCP server as a unit. Bypasses the Flatpak `/dev/shm` sandbox by encoding Snowmix's shmsrc output to H264/MPEG-TS and serving over TCP localhost. Also runnable as a standalone CLI (`python obs_bridge.py --video /path/to.mp4`).
+- `ini/obs.ini` — Snowmix INI for OBS integration: socket at `~/.snowmix-sockets/mixer1` (Flatpak-accessible home-dir path), 1280x720 BGRA, 24fps.
 - `pyproject.toml` — pytest asyncio config + ruff settings.
 - `conftest.py` — pytest-asyncio auto mode.
 
@@ -94,6 +96,10 @@ This skill governs the Python `fastmcp` server at `/home/rjodouin/Documents/git/
 | **Commands (Macros)** | |
 | `snowmix_command_list` | List all custom commands (macros). |
 | `snowmix_command_delete` | Delete a custom command by name. |
+| **OBS TCP Bridge** | |
+| `snowmix_bridge_start` | Start Snowmix + video input + TCP bridge for Flatpak OBS. |
+| `snowmix_bridge_stop` | Stop the running OBS TCP bridge and all subprocesses. |
+| `snowmix_bridge_status` | Check the status of the OBS TCP bridge. |
 
 ## Critical Snowmix Protocol Quirks
 
@@ -177,15 +183,41 @@ In Snowmix 0.5.0+, `text place <subcommand>` is **OBSOLETE**. The `text place` p
 
 Found in `video_text.cpp` lines 276-278: the parser explicitly checks for and rejects `text place <word>` where `<word>` is not a number.
 
-### Image Overlay Requires Running Pipeline (Critical)
+### Image/Text Overlay Must Run Inside the Macro (Critical)
 
-`image overlay <place_ids>` requires a running video pipeline — `m_overlay` is NULL until frame processing starts. Without a pipeline, Snowmix returns `MSG: Invalid parameters`.
+`image overlay <place_ids>` and `text overlay <ids>` only work **during the
+per-frame mixing loop**. `m_overlay` (the mixing buffer) is set at the start of
+each `MixFrame` call (video_mixer.cpp:1471/1484) and **reset to NULL after each
+frame** (video_mixer.cpp:1608). Calling `image overlay` as a one-shot command
+between frames therefore ALWAYS returns `MSG: Invalid parameters` — even with a
+fully running pipeline. The earlier belief that "a running pipeline makes the
+one-shot work" is FALSE.
 
-To make `image overlay` work:
-1. Start GStreamer input pipeline feeding video into a Snowmix feed via shmsink
-2. Start GStreamer output pipeline reading from Snowmix's mixer socket via shmsrc
-3. The mixing loop activates when output starts reading frames
-4. NOW `image overlay` will succeed
+The correct pattern: embed the overlay commands in the `overlay finish` macro
+(`Show`), which Snowmix executes once per output frame while `m_overlay` is
+valid. Configure it before starting the output pipeline:
+
+```python
+# Load + place image and set up text BEFORE building the macro
+await client.image_load(1, IMAGE_FILE)
+await client.image_place(1, 1, 100, 50)
+await client.send_command("text string 1 Snowmix_E2E_Test")
+await client.send_command("text font 1 FreeSans 24")
+await client.text_place(1, 1, 1, 50, 50)
+
+# Rebuild Show to overlay image 1 + text 1 every frame
+await client.command_delete("Show")
+await client.command_create("Show")
+await client.send_command("image overlay 1")   # recorded into Show
+await client.send_command("text overlay 1")     # recorded into Show
+await client.send_command("loop")               # recorded into Show
+await client.command_end()
+await client.send_command("overlay finish Show")
+```
+
+Then start the GStreamer output pipeline — the shmsrc connecting to the mixer
+socket activates the mixing loop, which runs `Show` every frame, applying the
+overlays automatically. See `test_e2e.py::test_image_overlay_during_pipeline`.
 
 ### No `image list` or `image info` Command
 
@@ -206,17 +238,98 @@ To use GStreamer pipelines with Snowmix feeds:
 4. `feed live <id>` — mark as live
 5. `stack 0 <feed_id>` — stack the feed onto the mixer output
 
-**Pitfall:** `stack 0 <feed_id>` can crash Snowmix if the feed has no data source connected yet (no GStreamer shmsink writing to the feed socket). Either:
-- Stack only feed 0 (`stack 0`) before the pipeline starts, then `stack 0 <feed_id>` after data flows
-- Or start the GStreamer input pipeline first, then stack
+**Note:** `stack 0 <feed_id>` on an unconnected feed (no GStreamer shmsink yet)
+is SAFE — the feed enters SETUP state and no crash occurs. The earlier claim
+that stacking an unconnected feed crashes Snowmix was disproven; the real crash
+cause was the stdin/fd-1 issue (see Process Management below).
 
-### Snowmix Process Management for Tests
+### OBS Studio Integration via TCP Bridge (obs_bridge.py)
 
-When spawning Snowmix as a subprocess in tests:
-- **Use `stdout=DEVNULL`**, NOT `tee` or pipe redirection. Snowmix checks if stdout (fd 1) is closed and bails out with: `WARNING. Creating a socket returned fd 1. This means that stdout was closed upon startup. Bailing out.`
-- Always `pkill -9 snowmix` and clean up socket files (`/tmp/mixer1`, feed sockets) before starting
+When OBS Studio is installed as a **Flatpak** (`com.obsproject.Studio`), its
+`bwrap` sandbox gives OBS a private `/tmp` namespace AND a private `/dev/shm`
+tmpfs. This breaks both socket discovery and shared-memory mmap:
+
+1. `/tmp/mixer1` is invisible to Flatpak OBS → use `~/.snowmix-sockets/mixer1`
+2. `shmsrc` can't mmap `/dev/shm/shmpipe.*` even with the home-dir socket → bwrap mounts its own tmpfs at `/dev/shm`
+
+The `obs_bridge.py` module solves this by running a **host-side GStreamer
+bridge process** that reads Snowmix output via `shmsrc` (host has full
+`/dev/shm` access), encodes to H264, muxes to MPEG-TS, and serves over TCP on
+localhost. Flatpak allows localhost network, so OBS connects via `tcpclientsrc`.
+
+```
+Video file → GStreamer (shmsink) → Snowmix feed socket
+                                      |
+                            Snowmix mixing loop (Show macro)
+                                      |
+OBS ← tcpclientsrc ← tsdemux ← decodebin ← tcpserversink ← x264enc ← shmsrc ← mixer socket
+         (port 5000, localhost)                      (host-side bridge process)
+```
+
+**Socket paths** (must be in home dir for Flatpak access):
+- Mixer output: `~/.snowmix-sockets/mixer1`
+- Feed input: `~/.snowmix-sockets/feed1-control-pipe`
+
+**INI**: Use `ini/obs.ini` (socket at `~/.snowmix-sockets/mixer1`, 1280x720 BGRA, 24fps).
+
+**MCP tools**: `snowmix_bridge_start`, `snowmix_bridge_stop`, `snowmix_bridge_status`.
+
+**Standalone CLI**:
+```bash
+source venv/bin/activate
+python obs_bridge.py --video /path/to/video.mp4 --image /path/to/overlay.png --text "Live"
+```
+
+**OBS obs-gstreamer pipeline** (copy into the source Pipeline field):
+```
+tcpclientsrc host=127.0.0.1 port=5000 ! tsdemux ! decodebin ! videoconvert ! video.
+```
+
+The bridge auto-restarts the video input when the file reaches EOS, so it runs
+indefinitely until stopped. The `video.` at the end is the obs-gstreamer
+internal sink — never use `ximagesink` or `autovideosink` (causes "Could not
+initialise X output").
+
+See `references/gstreamer-e2e-pipelines.md` → "OBS Studio Integration" for the
+full pipeline patterns and Flatpak sandbox analysis.
+
+### Snowmix Process Management for Tests (Critical)
+
+**Root cause of the fd-1 bail-out:** Snowmix creates a default controller wired
+to stdin (fd 0) / stdout (fd 1) at startup (controller.cpp ~line 131:
+`CreateController(0, 1)`). When stdin EOFs (e.g. the test harness inherits
+/dev/null or a closed pipe), that controller's read loop exits and
+`ControllerListDeleteElement` closes BOTH `read_fd` (fd 0) AND `write_fd`
+(fd 1). With fd 1 now free, the next `feed socket` command creates an AF_UNIX
+socket that the OS assigns to fd 1, and Snowmix bails out:
+
+```
+WARNING. Creating a socket returned fd 1. This means that stdout was closed
+upon startup. Bailing out.
+```
+
+**The fix is stdin, NOT stdout.** Keep stdin open so the default controller
+never EOFs. Use `stdin=asyncio.subprocess.PIPE` (held open for the process
+lifetime — never write to it, never close it):
+
+```python
+proc = await asyncio.create_subprocess_exec(
+    SNOWMIX_BIN, str(INI_PATH),
+    stdin=asyncio.subprocess.PIPE,   # CRITICAL: keep stdin open
+    stdout=asyncio.subprocess.DEVNULL,
+    stderr=asyncio.subprocess.PIPE,
+)
+```
+
+Using `stdout=DEVNULL` is fine (fd 1 points to /dev/null, which stays open as
+long as the default controller is alive), but it does NOT by itself prevent the
+bail-out — the bail-out is triggered by stdin EOF closing the controller, not by
+stdout redirection.
+
+Other process-management rules:
+- `pkill -9 snowmix` and clean up socket files (`/tmp/mixer1`, feed sockets) before starting
 - Wait 2 seconds after spawn for port 9999 to bind
-- The `SNOWMIX` env var must point to the installation root (e.g., `/home/rjodouin/Snowmix-0.5.2.2`), NOT the `src/` subdirectory
+- The `SNOWMIX` env var must point to the installation root (e.g. `/home/rjodouin/Snowmix-0.5.2.2`), NOT the `src/` subdirectory
 
 ## Common Snowmix Reserved Commands
 
@@ -302,8 +415,9 @@ SNOWMIX_BIN = os.environ.get("SNOWMIX_BIN", "/usr/local/bin/snowmix")
 async def snowmix_process():
     proc = await asyncio.create_subprocess_exec(
         SNOWMIX_BIN, str(INI_PATH),
+        stdin=asyncio.subprocess.PIPE,   # keep stdin open — see Process Management
         stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
     await asyncio.sleep(2)  # Allow time to bind
     yield proc
@@ -374,9 +488,15 @@ See `references/node-snowmix-tests.md` for detailed port status.
 9. **maxplaces BEFORE system geometry**: The maxplaces directives in the INI file must appear BEFORE `system geometry`. Geometry triggers CVideoFeeds creation which locks in the max. If maxplaces comes after, defaults (16) are baked in and your directives silently fail. This is the #1 cause of "Invalid number of parameters" on image/text commands with IDs > 16.
 10. **image load — NO quotes on file path**: The C parser uses `sscanf("%u %[^\n]")` which does not strip quotes. `image load 1 "/path/to/file.png"` will fail. Send the bare path: `image load 1 /path/to/file.png`.
 11. **text place <subcommand> is OBSOLETE in 0.5.0+**: Use `text align`, `text backgr`, `text clipabs`, `text repeat move` directly. The `text place` prefix is only valid for the numeric placement command: `text place <place_id> <text_id> <font_id> <x> <y> ...`.
-12. **image overlay requires running pipeline**: `image overlay` returns "Invalid parameters" unless GStreamer input+output pipelines are active (m_overlay is NULL until frame processing starts).
-13. **Snowmix stdout must be DEVNULL**: When spawning Snowmix as a subprocess, use `stdout=DEVNULL`. Using `tee` or pipe redirection closes fd 1, causing Snowmix to bail with "Creating a socket returned fd 1. This means that stdout was closed upon startup."
-14. **stack can crash Snowmix**: `stack 0 <feed_id>` can crash Snowmix if the feed has no data source connected. Start the GStreamer input pipeline first, then stack.
+12. **image/text overlay must run inside the Show macro**: `image overlay` / `text overlay` return "Invalid parameters" as one-shot commands — `m_overlay` is NULL between frames even with a running pipeline. Embed them in the `overlay finish` macro (Show), which runs once per output frame. See the "Image/Text Overlay Must Run Inside the Macro" section above.
+13. **Snowmix stdin must stay open (fd-1 bail-out)**: If stdin EOFs, the default stdin/stdout controller closes, taking fd 1 with it. The next `feed socket` creates a socket on fd 1 → Snowmix bails out. FIX: `stdin=asyncio.subprocess.PIPE` held open. `stdout=DEVNULL` alone does NOT fix this. See Process Management section.
+14. **stack on unconnected feed is SAFE**: `stack 0 <feed_id>` before the GStreamer input starts does NOT crash Snowmix — the feed enters SETUP state. The earlier "stack crashes" claim was a misdiagnosis of the fd-1 bail-out.
+15. **gst-launch-1.0 rejects single-argv pipelines**: This build of gst-launch-1.0 does NOT accept the pipeline as a single quoted string argument ("erroneous pipeline: syntax error"). Pass space-split tokens via `shlex.split(pipeline)` so `!` is its own argv element: `create_subprocess_exec(GST_LAUNCH, "-q", *shlex.split(pipeline))`.
+16. **Stop output pipeline with SIGINT for valid mp4**: When using `gst-launch -e ... mp4mux ... filesink`, send `SIGINT` (not SIGTERM) to the output process so gst-launch sends EOS and mp4mux finalises a valid, playable mp4.
+17. **Flatpak OBS cannot see /tmp sockets**: If OBS is installed as Flatpak, it runs in a bwrap sandbox with its own `/tmp` namespace. `/tmp/mixer1` is invisible to it. Put sockets in `~/.snowmix-sockets/` and use that path in both the INI (`system socket`) and the obs-gstreamer pipeline. See `references/gstreamer-e2e-pipelines.md` → "Flatpak OBS Cannot See /tmp Sockets".
+18. **OBS source activation timing**: OBS only connects to shmsrc when the source is activated. If the socket doesn't exist at activation, it fails silently and does NOT retry. Start Snowmix first, then toggle the OBS source (deactivate → wait 2s → activate) or re-open Properties and click OK.
+19. **obs-gstreamer pipelines must end with `video.`**: Never use `ximagesink`/`autovideosink` in obs-gstreamer — it causes "Could not initialise X output". The plugin provides internal sinks `video.` and `audio.` that hand frames to OBS.
+20. **Flatpak OBS cannot mmap /dev/shm — shmsrc is broken**: Even after moving the socket to `~/.snowmix-sockets/` (pitfall #17), `shmsrc` fails inside Flatpak OBS. The Unix socket connects, but bwrap mounts a private tmpfs at `/dev/shm`, so `shmsrc` can't mmap Snowmix's shared memory segment. Symptoms: Snowmix logs "Output pipe connection broken", OBS logs "Failed to read from shmsrc / Internal data stream error". `flatpak override --filesystem=/dev/shm` does NOT fix this. **Fix: TCP bridge** — run a host-side gst-launch process: `shmsrc -> x264enc -> mpegtsmux -> tcpserversink host=127.0.0.1 port=5000`. OBS uses: `tcpclientsrc host=127.0.0.1 port=5000 ! tsdemux ! decodebin ! videoconvert ! video.` See `references/gstreamer-e2e-pipelines.md` → "Flatpak OBS Cannot mmap /dev/shm".
 
 ## Maxplaces Keyword Reference
 
@@ -406,6 +526,7 @@ Usage in INI: `maxplaces images 5000` or `maxplaces video feeds 5000`.
 - `references/node-snowmix-tests.md` — Extracted test specs and mapping notes from the node-snowmix test suite.
 - `references/image-subsystem-diagnostics.md` — C++ source analysis of image load/name/overlay commands, maxplaces keywords, and subsystem activation quirks.
 - `references/advanced-tests-roadmap.md` — State of `test_advanced.py`, why `test_image_load_basic` fails, and how to complete the fix.
-- `references/gstreamer-e2e-pipelines.md` — GStreamer pipeline patterns for feeding video into Snowmix (shmsink) and reading mixed output (shmsrc), plus e2e test architecture.
+- `references/gstreamer-e2e-pipelines.md` — GStreamer pipeline patterns for feeding video into Snowmix (shmsink) and reading mixed output (shmsrc), plus e2e test architecture, OBS Studio integration via obs-gstreamer (shmsrc same-machine, RTP remote), and the live test script pattern.
+- `references/reserved_commands.md` — Verified command syntax reference for Snowmix 0.5.2.2 (all commands confirmed through C++ source analysis and the 42-test suite). Covers feeds, vfeeds, stacking, images, text, audio, macros, and INI config with pitfalls for each.
 - `/home/rjodouin/Documents/git/snowmix-fastmcp/snowmix_commands_reference.md` — Local command reference covering all 18 Snowmix command categories with verified syntax.
 - [Snowmix Reserved Commands](https://snowmix.sourceforge.io/Documentation/reserved.html) — Official documentation (note: syntax for some commands differs from source-code reality).

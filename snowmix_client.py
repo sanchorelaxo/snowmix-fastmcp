@@ -417,9 +417,10 @@ class SnowmixClient:
         return await self.send_command(f'image place {place_id} {image_id} {x} {y}')
 
     async def image_overlay(self, place_ids: list[int]) -> str:
-        """Overlay images. Requires a running video pipeline (m_overlay != NULL).
-
-        Without a pipeline, Snowmix returns 'Invalid parameters'.
+        """Overlay images. Only works inside the per-frame mixing loop
+        (the Show macro bound via `overlay finish`). Calling as a one-shot
+        command returns 'Invalid parameters' because m_overlay is NULL
+        between frames. See SKILL.md for the macro pattern.
         """
         return await self.send_command('image overlay ' + ' '.join(str(p) for p in place_ids))
 

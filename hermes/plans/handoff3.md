@@ -10,24 +10,42 @@ Created `test_e2e.py` with 3 tests:
 - `test_image_overlay_during_pipeline` — the core e2e: GStreamer feeds video in, MCP overlays image+text, GStreamer reads mixed output to MP4
 - `test_feed_status_after_streaming` — verify feed shows activity
 
-### Blocker
+### Blocker — RESOLVED
 
-The e2e test fails because Snowmix crashes when `stack 0 1` is sent. The first test (`test_feed_setup_and_stack`) gets a `ConnectionResetError` on the stack command, meaning Snowmix dies. Subsequent tests can't connect (port 9999 refused).
+The handoff3 blocker was misdiagnosed. `stack 0 1` does NOT crash Snowmix —
+stacking an unconnected feed is fine (feed shows SETUP state, no crash).
 
-**Root cause (likely):** `stack 0 1` tries to stack feed 1, but feed 1 has no data source connected yet (no GStreamer shmsink writing to the feed socket). Snowmix may crash when stacking a feed that has no shared memory area.
+**Actual root causes (two independent bugs):**
 
-**Possible fixes:**
+1. **Snowmix stdin/stdout controller closes fd 1.** Snowmix wires a default
+   controller to stdin(fd 0)/stdout(fd 1). If stdin EOFs (e.g. inherited
+   /dev/null in the test harness), that controller closes, taking fd 1 with
+   it. Later, `feed socket` creates an AF_UNIX socket that the OS assigns to
+   the now-free fd 1, and Snowmix bails out: "Creating a socket returned fd 1.
+   This means that stdout was closed upon startup."
+   **Fix:** start Snowmix with `stdin=asyncio.subprocess.PIPE` (held open for
+   the process lifetime) so the default controller never EOFs. See
+   `test_e2e.py` snowmix fixture.
 
-1. Stack only feed 0 (background) before the pipeline starts: `stack 0` instead of `stack 0 1`
-2. Start the GStreamer input pipeline FIRST, then stack feed 1 after data is flowing
-3. Reorder: create feed → start input → then stack
+2. **gst-launch-1.0 rejects the pipeline as a single argv string.** Passing
+   the whole pipeline as one `create_subprocess_exec` argument produces
+   "erroneous pipeline: syntax error". gst-launch wants space-split tokens
+   with `!` as a separate argv element.
+   **Fix:** `*shlex.split(pipeline)` in both `start_gstreamer_input` and
+   `start_gstreamer_output`.
 
-### Remaining (Task 8 from dev-plan.md)
+**Overlay architecture correction:**
 
-Once the stack crash is fixed, run the full suite:
+The original test called `image overlay 1` / `text overlay 1` as one-shot
+standalone commands. This always fails with "Invalid parameters" because
+`m_overlay` (the mixing buffer) is only non-NULL *during* the per-frame
+mixing loop — it is reset to NULL after each frame (video_mixer.cpp:1608).
+The correct Snowmix pattern: embed `image overlay` / `text overlay` inside
+the `overlay finish` macro (`Show`), which Snowmix executes once per output
+frame. The test now rebuilds `Show` with `image overlay 1`, `text overlay 1`,
+`loop`, then re-binds it with `overlay finish Show`.
 
-```bash
-SNOWMIX=/home/rjodouin/Snowmix-0.5.2.2 ./venv/bin/pytest test_snowmix.py test_advanced.py test_e2e.py -v -s
-```
+### Result — DONE
 
-Note: `test_advanced.py` and `test_e2e.py` both use module-scoped Snowmix fixtures on port 9999, so they should be run sequentially (pytest does this by default with module scope, but both kill stale Snowmix in their fixtures).
+Full suite 42/42 pass. The core e2e test produces a valid h264 1280x720 mp4
+(verified via ffprobe: 144 frames / ~6s in the test run).

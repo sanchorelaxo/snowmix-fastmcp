@@ -2,8 +2,10 @@
 
 ## Status
 - Baseline: 25/25 tests pass in test_snowmix.py with test.ini
-- test_advanced.py: 14 tests, all failing due to INI + client issues
-- End-to-end test: not yet created
+- test_advanced.py: 14/14 pass (INI + client issues fixed)
+- test_e2e.py: 3/3 pass — full pipeline (video in → image+text overlay via
+  Show macro → mixed mp4 out). Output verified as valid h264 1280x720 mp4.
+- Full suite: 42/42 pass.
 
 ## Root Causes Identified
 

@@ -67,27 +67,20 @@ async def snowmix_process():
     env = {**os.environ, "SNOWMIX": SNOWMIX_HOME}
     proc = await asyncio.create_subprocess_exec(
         SNOWMIX_BIN, str(INI_PATH),
+        stdin=asyncio.subprocess.PIPE,   # CRITICAL: prevents fd-1 bail-out
         stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
         env=env,
     )
     await asyncio.sleep(2)
-    # optional: connect once and bump maxplaces globally
-    c = SnowmixClient(port=9999)
-    await c.connect()
-    for cmd in [
-        "image maxplaces load 500",
-        "image maxplaces place 500",
-        "text maxplaces string 500",
-        "text maxplaces font 500",
-        "text maxplaces place 500",
-        "feed maxplaces 500",
-    ]:
-        await c.send_command(cmd)
-    await c.close()
     yield proc
     # ...terminate...
 ```
+
+Note: the runtime maxplaces bumps originally shown here (connecting once and
+sending `image maxplaces load 500` etc.) are unnecessary if the INI file
+places `maxplaces` directives BEFORE `system geometry` — which is the
+correct approach (see SKILL.md). The INI-level approach is preferred.
 
 ## Other traps seen during implementation
 

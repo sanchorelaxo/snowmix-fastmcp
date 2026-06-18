@@ -573,5 +573,99 @@ async def snowmix_command_delete(name: str) -> str:
         await client.close()
 
 
+# ------------------------------------------------------------------ #
+#  OBS TCP Bridge (Flatpak sandbox workaround)
+# ------------------------------------------------------------------ #
+
+# Module-level bridge instance so tools can query/stop a running bridge
+# started by snowmix_bridge_start.
+_active_bridge: "SnowmixBridge | None" = None
+
+
+@mcp.tool()
+async def snowmix_bridge_start(
+    video_file: str = "",
+    image_file: str = "",
+    text_string: str = "Snowmix",
+    width: int = 1280,
+    height: int = 720,
+    tcp_port: int = 5000,
+) -> str:
+    """
+    Start the OBS TCP bridge: Snowmix + video input + TCP server.
+
+    This bypasses the Flatpak /dev/shm sandbox that prevents OBS Studio's
+    GStreamer shmsrc from mmap-ing Snowmix's shared-memory segments.
+    The bridge reads Snowmix output via shmsrc on the host and re-serves
+    it over TCP localhost (port 5000 by default).
+
+    In OBS, add an obs-gstreamer source with pipeline:
+        tcpclientsrc host=127.0.0.1 port=5000 ! tsdemux ! decodebin ! videoconvert ! video.
+
+    Args:
+        video_file: Path to video file for feed input (empty = no video input).
+        image_file: Path to PNG image overlay (empty = no image).
+        text_string: Text overlay string (empty = no text).
+        width: Video width (must match ini, default 1280).
+        height: Video height (must match ini, default 720).
+        tcp_port: TCP port for OBS to connect to (default 5000).
+    """
+    global _active_bridge
+    from obs_bridge import BridgeConfig, SnowmixBridge
+
+    if _active_bridge and _active_bridge.status.running:
+        await _active_bridge.stop()
+
+    config = BridgeConfig(
+        video_file=video_file,
+        image_file=image_file,
+        text_string=text_string,
+        width=width,
+        height=height,
+        tcp_port=tcp_port,
+    )
+    _active_bridge = SnowmixBridge(config)
+    status = await _active_bridge.start()
+    if status.errors:
+        return f"Bridge failed: {'; '.join(status.errors)}"
+    return (
+        f"OBS TCP bridge started.\n"
+        f"  Snowmix PID: {status.snowmix_pid}\n"
+        f"  Input PID:   {status.input_pid}\n"
+        f"  Bridge PID:  {status.bridge_pid}\n"
+        f"  TCP port:    {status.tcp_port}\n"
+        f"  OBS pipeline:\n    {status.obs_pipeline}"
+    )
+
+
+@mcp.tool()
+async def snowmix_bridge_stop() -> str:
+    """Stop the running OBS TCP bridge and all its subprocesses."""
+    global _active_bridge
+    if not _active_bridge:
+        return "No active bridge."
+    await _active_bridge.stop()
+    _active_bridge = None
+    return "OBS TCP bridge stopped."
+
+
+@mcp.tool()
+async def snowmix_bridge_status() -> str:
+    """Check the status of the OBS TCP bridge."""
+    global _active_bridge
+    if not _active_bridge:
+        return "No active bridge."
+    s = _active_bridge.status
+    return (
+        f"Running: {s.running}\n"
+        f"  Snowmix PID: {s.snowmix_pid}\n"
+        f"  Input PID:   {s.input_pid}\n"
+        f"  Bridge PID:  {s.bridge_pid}\n"
+        f"  TCP port:    {s.tcp_port}\n"
+        f"  Mixer socket: {s.mixer_socket}\n"
+        f"  OBS pipeline:\n    {s.obs_pipeline}"
+    )
+
+
 if __name__ == "__main__":
     mcp.run()
